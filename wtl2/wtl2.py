@@ -10,7 +10,7 @@ from scipy.interpolate import interp1d
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import cv2
-
+from skimage.color import label2rgb
 
 class WtL2:
     def __init__(self, checkpoint_path, device):
@@ -54,23 +54,37 @@ class WtL2:
 
             labeled_image, segments = label(cont_nms, return_num=True)
 
+            props = regionprops(labeled_image)
+            centroids = {p.label: p.centroid for p in props}
+
+            kernel = np.ones((3,3), dtype=int)
+            neighbor_count = ndi.convolve(cont_nms.astype(int), kernel, mode='constant')
+            all_endpoints_mask = (cont_nms == 1) & (neighbor_count == 2)
+
+            yy, xx = np.nonzero(all_endpoints_mask)
+            labels_at_endpoints = labeled_image[yy, xx]
+
+            endpoints_by_label = {}
+            for y, x, lbl in zip(yy, xx, labels_at_endpoints):
+                if lbl == 0: continue
+                endpoints_by_label.setdefault(lbl, []).append((y, x))
+
             endpoints = np.zeros((2, segments - 1, 2), dtype=np.int32)
             endpoints_ang = np.zeros((2, segments - 1))
-            for i in range(0, segments - 1):
-                segment = labeled_image == i + 1
-                segment = ndi.binary_fill_holes(segment)
-                endpoints_mask = bwmorph_endpoints(segment)
 
-                coords = np.array(np.nonzero(endpoints_mask)).T
-                if len(coords) == 1: coords = np.repeat(coords, 2, axis=0)
-                if len(coords) != 2:
-                    d = np.zeros(coords.size)
-                    props = regionprops(segment.astype(np.int32))
-                    x2, y2 = props[0].centroid
-                    for j, (y1, x1) in enumerate(coords):
-                        d[j] = np.hypot(x2 - x1, y2 - y1)
-                    endpoints[:, i] = coords[np.argsort(d)[-2:][::-1]]
-                else: endpoints[:, i] = coords
+            for i in tqdm(range(0, segments - 1), disable=True):
+                segment = (labeled_image == i + 1)
+                coords = np.array(endpoints_by_label.get(i+1, []), dtype=int)
+
+                if len(coords) < 1: continue
+                elif len(coords) == 1: coords = np.repeat(coords, 2, axis=0)
+                elif len(coords) > 2:
+                    x2, y2 = centroids[i+1]
+                    d = np.hypot(coords[:,0] - y2, coords[:,1] - x2)
+                    coords = coords[np.argsort(d)[-2:][::-1]]
+                if 0 in coords: print(coords)
+
+                endpoints[:, i] = coords
 
                 for ep_idx in range(2):
                     neighbors = get_neighbors(segment, *coords[ep_idx])
@@ -80,11 +94,13 @@ class WtL2:
                     endpoints_ang[ep_idx, i] = np.degrees(angle_rad) % 360
 
             center_points = endpoints.reshape(-1, 2)
+            skipped_points = ~np.all(center_points== 0, axis=1)
+            center_points = center_points[skipped_points]
             Y, X = center_points.T
             prio = cont[Y, X]
-            angles = endpoints_ang.flatten()
+            angles = endpoints_ang.flatten()[skipped_points]
             group = labeled_image[Y, X]
-            running = np.zeros(Y.shape, dtype=np.int32)
+            running = np.ones(Y.shape, dtype=np.int32)
             pix_list = get_pixel_idx_list(labeled_image)
 
             interp_unique = interp1d(self.unique_angles, self.unique_angles, kind="nearest", bounds_error=False)
@@ -93,9 +109,7 @@ class WtL2:
             inputs = np.concatenate([img, cont[...,None]], axis=2).astype(np.float32)
             crop_size = 13
 
-            running[0] = 1
             step = 0
-            temp = np.zeros(labeled_image.shape, dtype=np.uint8)
             num_tracers = running.sum()
             with tqdm(total=num_tracers, desc=f"Running Tracers [flipped={flipped}]", disable=not verbose) as pbar:
                 while num_tracers > 0:
@@ -145,7 +159,6 @@ class WtL2:
                     Y, X = new_center_points.T
                     labeled_image[Y, X] = group
                     accumulator[Y, X] += 0.05
-                    temp[Y, X] = 255
 
                     for i, (y, x, g) in enumerate(zip(Y, X, group)):
                         g = int(g)
@@ -160,11 +173,8 @@ class WtL2:
                     num_tracers = running.sum()
                     pbar.update(old_num_tracers - num_tracers)
                     if visualization: visualize(fig, ax, labeled_image, num_tracers)
-                    if not flipped: 
-                        cv2.imwrite(f"/home/sven/work/WalktheLines2/dev/viz/tracer/{step:03d}.png", temp)
-                        cv2.imwrite(f"/home/sven/work/WalktheLines2/dev/viz/rgb.png", (img / 256).astype(np.uint8)[...,::-1])
                     step+=1
 
         if visualization: plt.close("all")
         result = (np.clip(accumulator, 0, 1) * 255).astype(np.uint8)
-        return img, temp
+        return result
